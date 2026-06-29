@@ -74,7 +74,7 @@ _TIER_CONFIG: Dict[RecallTier, Dict[str, Any]] = {
     },
     RecallTier.BURN: {
         "max_hops": 3,
-        "min_path_score": 0.05,
+        "min_path_score": 0.01,
         "min_node_strength": 0.3,
         "top_k": 5,
         "use_fts5_first": True,
@@ -236,28 +236,53 @@ def retrieve(
     entities = extract_entities(query)
     logger.debug("Entities extracted: %s", entities)
 
-    if not entities and use_fts5_first:
-        # Fall back to FTS5
-        fts_results = _retrieve_fts5_only(db, query, actual_top_k, actual_min_strength)
-        if fts_results:
-            return fts_results
-
+    # Step 1b — Fallback: FTS5 nodes as graph-walk entry points
+    # (applies to ALL tiers when entity extraction leaves nothing)
     if not entities:
-        # Pure strength fallback
+        fts_nodes = _fts5_nodes(db, query, actual_top_k, actual_min_strength)
+        if fts_nodes:
+            # Use FTS5 matches as entry nodes for graph walk
+            visited: set = set()
+            all_paths: List[ScoredPath] = []
+            for node in fts_nodes:
+                paths = walk_graph(
+                    db, node.id,
+                    max_hops=actual_max_hops,
+                    visited=visited,
+                )
+                for p in paths:
+                    if p.score >= min_path_score:
+                        all_paths.append(p)
+            if all_paths:
+                all_paths.sort(key=lambda p: p.score, reverse=True)
+                seen: set = set()
+                deduped = []
+                for p in all_paths:
+                    sig = " → ".join(n.id for n in p.nodes)
+                    if sig not in seen:
+                        seen.add(sig)
+                        deduped.append(p)
+                        if len(deduped) >= actual_top_k:
+                            break
+                return deduped
+            # FTS5 found nodes but no multi-hop paths — return flat results
+            return [ScoredPath(nodes=[n], links=[], score=n.strength) for n in fts_nodes]
+
+        # Pure strength fallback (neither entities nor FTS5 found anything)
         fallback_nodes = db.search_nodes(min_strength=actual_min_strength, limit=actual_top_k)
         return [
             ScoredPath(nodes=[n], links=[], score=n.strength)
             for n in fallback_nodes
         ]
 
-    # Step 2 — Find entry nodes.
+    # Step 2 — Find entry nodes via entity matching.
     entry_matches = db.find_nodes_by_entities(entities, min_strength=actual_min_strength)
 
     if not entry_matches:
         if use_fts5_first:
-            fts_results = _retrieve_fts5_only(db, query, actual_top_k, actual_min_strength)
-            if fts_results:
-                return fts_results
+            fts_nodes = _fts5_nodes(db, query, actual_top_k, actual_min_strength)
+            if fts_nodes:
+                return [ScoredPath(nodes=[n], links=[], score=n.strength) for n in fts_nodes]
         fallback_nodes = db.search_nodes(min_strength=actual_min_strength, limit=actual_top_k)
         return [
             ScoredPath(nodes=[n], links=[], score=n.strength)
@@ -315,6 +340,19 @@ def _retrieve_fts5_only(
         ScoredPath(nodes=[n], links=[], score=n.strength)
         for n in nodes if n.strength >= min_strength
     ]
+
+
+def _fts5_nodes(
+    db: AgMemDB,
+    query: str,
+    top_k: int,
+    min_strength: float,
+) -> List[Node]:
+    """FTS5 search returning raw nodes (for graph-walk entry points)."""
+    if not query or not query.strip():
+        return []
+    nodes = db.fts5_search(query, limit=top_k)
+    return [n for n in nodes if n.strength >= min_strength]
 
 
 # ---------------------------------------------------------------------------
