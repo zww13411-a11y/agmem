@@ -8,6 +8,8 @@ and hop-distance decay.
 from __future__ import annotations
 
 import logging
+import math
+import time
 from typing import Dict, List, Optional, Set, Tuple
 
 from agmem.core import AgMemDB, Link, Node, ScoredPath
@@ -93,6 +95,8 @@ def walk_graph(
                 score = _compute_path_score(path, link, neighbor)
                 if score < MIN_PATH_SCORE:
                     continue
+                if _detect_cycle([*path.nodes, neighbor]):
+                    continue
                 new_paths.append(
                     ScoredPath(
                         nodes=[*path.nodes, neighbor],
@@ -118,6 +122,8 @@ def walk_graph(
                 score = _compute_path_score(path, link, neighbor)
                 if score < MIN_PATH_SCORE:
                     continue
+                if _detect_cycle([*path.nodes, neighbor]):
+                    continue
                 new_paths.append(
                     ScoredPath(
                         nodes=[*path.nodes, neighbor],
@@ -139,20 +145,33 @@ def score_path(
     links: List[Link],
     *,
     hop_decay: float = HOP_DECAY_FACTOR,
+    time_decay_days: float = 30.0,
 ) -> float:
     """Compute a composite score for a node-and-link chain.
 
     Formula::
 
         score = ∏(node_i.strength) × ∏(link.weight) × hop_decay ** hops
+                × time_decay_factor
 
-    where ``hops`` is the number of link traversals, consistent with the
-    incremental scoring used during graph walk.
+    The *time_decay_factor* applies a gentle discount based on how long
+    ago the first (entry) node was created::
+
+        factor = exp(-days_since / time_decay_days)
+
+    ``time_decay_days=30`` means a memory from 30 days ago gets a ~0.37×
+    discount, while one from 7 days ago gets ~0.79×.  Set to ``0`` to
+    disable time decay entirely.
     """
     if not nodes:
         return 0.0
 
-    score = nodes[0].strength
+    now = time.time()
+    created_ts = nodes[0].created_at
+    days_since = max(0.0, (now - created_ts) / 86400.0) if created_ts and time_decay_days > 0 else 0.0
+    time_factor = math.exp(-days_since / time_decay_days) if time_decay_days > 0 and days_since > 0 else 1.0
+
+    score = nodes[0].strength * time_factor
     for i, link in enumerate(links):
         target_node = nodes[i + 1]
         score *= link.weight * target_node.strength * hop_decay
@@ -163,6 +182,19 @@ def score_path(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _detect_cycle(path_nodes: List[Node]) -> bool:
+    """Return True if *path_nodes* contains a cycle (same node id appears twice).
+
+    Uses a simple visited set over node ids.  O(n) in path length.
+    """
+    seen: set = set()
+    for n in path_nodes:
+        if n.id in seen:
+            return True
+        seen.add(n.id)
+    return False
 
 
 def _compute_path_score(

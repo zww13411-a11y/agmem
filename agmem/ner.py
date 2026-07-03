@@ -28,7 +28,7 @@ SYNONYM_MAP: Dict[str, str] = {
     "sqlite3": "SQLite",
     "postgresql": "PostgreSQL",
     "postgres": "PostgreSQL",
-    "pg": "DB",
+    "pg": "PostgreSQL",
     "pg database": "PostgreSQL",
     "db": "DB",
     "database": "DB",
@@ -37,7 +37,7 @@ SYNONYM_MAP: Dict[str, str] = {
     "缓存": "cache",
     "cache": "cache",
     "caching": "cache",
-    "redis cache": "cache",
+    "redis cache": "Redis",
     "记忆": "memory",
     "记忆系统": "memory system",
     "memory system": "memory system",
@@ -258,7 +258,7 @@ def _get_jieba():
             import jieba
             _JIEBA = jieba
         except ImportError:
-            pass
+            logger.warning("jieba not installed — Chinese entity extraction disabled")
     return _JIEBA
 
 
