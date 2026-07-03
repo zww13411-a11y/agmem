@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -137,13 +138,36 @@ class AgMemDB:
     db = AgMemDB("agmem.db")          # on-disk persistence
     """
 
+    _thread_conns: Dict[int, sqlite3.Connection] = {}
+    """Per-thread connection cache for thread-safe access."""
+
     def __init__(self, db_path: str = "agmem.db") -> None:
         self._db_path = db_path
-        self._conn: sqlite3.Connection = sqlite3.connect(db_path)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._thread_lock = threading.Lock()
+        self._get_conn()
         self._init_schema()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get or create a connection for the current thread.
+
+        Each thread gets its own connection to avoid SQLite thread-safety
+        issues.  All connections share the same WAL-mode database file, so
+        reads and writes are serialized at the file level.
+        """
+        tid = threading.get_ident()
+        if tid not in self._thread_conns:
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            with self._thread_lock:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA foreign_keys=ON")
+            self._thread_conns[tid] = conn
+        return self._thread_conns[tid]
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """Convenience accessor — returns the current thread's connection."""
+        return self._get_conn()
 
     # ------------------------------------------------------------------
     # Schema
@@ -584,7 +608,10 @@ class AgMemDB:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        self._conn.close()
+        """Close all thread-local connections."""
+        for tid, conn in self._thread_conns.items():
+            conn.close()
+        self._thread_conns.clear()
 
     def __enter__(self) -> AgMemDB:
         return self
