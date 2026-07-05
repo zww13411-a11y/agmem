@@ -12,9 +12,35 @@ All timestamps are Unix epoch seconds (int).
 from __future__ import annotations
 
 import json
+import logging
+import re
 import sqlite3
 import threading
 import time
+
+logger = logging.getLogger(__name__)
+
+# jieba lazy import for Chinese segmentation
+_JIEBA = None
+_RE_ZH = re.compile(r"[一-鿿]")
+
+def _get_jieba():
+    global _JIEBA
+    if _JIEBA is None:
+        try:
+            import jieba
+            _JIEBA = jieba
+        except ImportError:
+            pass
+    return _JIEBA
+
+
+def _zh_segment(text: str) -> str:
+    """Space-separated jieba tokens for Chinese text, or '' if no Chinese."""
+    jieba = _get_jieba()
+    if not jieba or not _RE_ZH.search(text):
+        return ""
+    return " ".join(jieba.cut(text))
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -218,6 +244,7 @@ class AgMemDB:
             -- FTS5 full-text search index
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
                 content,
+                content_zh,  -- jieba-segmented Chinese
                 node_type UNINDEXED,
                 entities UNINDEXED,
                 id UNINDEXED,
@@ -262,9 +289,10 @@ class AgMemDB:
 
         # Direct FTS5 insert (no delete needed — fresh node)
         entities_text = " ".join(entities or [])
+        zh_segmented = _zh_segment(content)
         self._conn.execute(
-            "INSERT OR IGNORE INTO nodes_fts (id, content, node_type, entities) VALUES (?, ?, ?, ?)",
-            (node_id, content, node_type, entities_text),
+            "INSERT OR IGNORE INTO nodes_fts (id, content, content_zh, node_type, entities) VALUES (?, ?, ?, ?, ?)",
+            (node_id, content, zh_segmented, node_type, entities_text),
         )
         self._conn.commit()
         return Node(
@@ -541,9 +569,11 @@ class AgMemDB:
         self._conn.execute("DELETE FROM nodes_fts WHERE id = ?", (node_id,))
         # Store entities as space-separated plain text for clean FTS5 search
         entities_text = " ".join(node.entities) if node.entities else ""
+        # Pre-segment Chinese content for FTS5
+        zh_segmented = _zh_segment(node.content)
         self._conn.execute(
-            "INSERT INTO nodes_fts (id, content, node_type, entities) VALUES (?, ?, ?, ?)",
-            (node.id, node.content, node.node_type, entities_text),
+            "INSERT INTO nodes_fts (id, content, content_zh, node_type, entities) VALUES (?, ?, ?, ?, ?)",
+            (node.id, node.content, zh_segmented, node.node_type, entities_text),
         )
         self._conn.commit()
 
@@ -560,11 +590,57 @@ class AgMemDB:
         - Phrase: ``"data science"`` → exact phrase match
         - Column: ``content: redis`` → search in content only
 
-        Returns nodes sorted by FTS5 rank (best match first).
+        Chinese queries are automatically segmented with jieba and matched
+        against the ``content_zh`` column.  English/ASCII queries match
+        the ``content`` column.
         """
         if not query or not query.strip():
             return []
 
+        q = query.strip()
+
+        # Detect Chinese — if present, search content_zh with jieba
+        jieba = _get_jieba()
+        have_zh = jieba and _RE_ZH.search(q)
+
+        if have_zh:
+            # Segment the query, then search BOTH content and content_zh
+            zh_tokens = " ".join(jieba.cut(q))
+            try:
+                rows = self._conn.execute(
+                    """SELECT n.* FROM nodes n
+                       JOIN nodes_fts fts ON n.id = fts.id
+                       WHERE nodes_fts MATCH ?
+                       ORDER BY rank
+                       LIMIT ?""",
+                    (f"content_zh:{zh_tokens}", limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+
+            # Also try raw match on content (for exact hits)
+            try:
+                raw_rows = self._conn.execute(
+                    """SELECT n.* FROM nodes n
+                       JOIN nodes_fts fts ON n.id = fts.id
+                       WHERE nodes_fts MATCH ?
+                       ORDER BY rank
+                       LIMIT ?""",
+                    (q, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                raw_rows = []
+
+            # Merge and deduplicate by id
+            seen = set()
+            merged = []
+            for r in list(raw_rows) + list(rows):
+                if r["id"] not in seen:
+                    seen.add(r["id"])
+                    merged.append(r)
+            return [self._row_to_node(r) for r in merged[:limit]]
+
+        # English/ASCII query: standard FTS5 on content
         try:
             rows = self._conn.execute(
                 """SELECT n.* FROM nodes n
@@ -572,11 +648,11 @@ class AgMemDB:
                    WHERE nodes_fts MATCH ?
                    ORDER BY rank
                    LIMIT ?""",
-                (query.strip(), limit),
+                (q, limit),
             ).fetchall()
         except sqlite3.OperationalError:
             # Invalid FTS5 query syntax — fall back to LIKE
-            like = f"%{query.strip()}%"
+            like = f"%{q}%"
             rows = self._conn.execute(
                 "SELECT * FROM nodes WHERE content LIKE ? OR entities LIKE ? LIMIT ?",
                 (like, like, limit),
