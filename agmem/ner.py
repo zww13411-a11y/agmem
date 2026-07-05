@@ -15,8 +15,11 @@ Plus:
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Tier 0 — Synonym map (木行: 蠢 — 群起响应, resonance across aliases)

@@ -260,7 +260,7 @@ def run_consolidation(
                 report.links_pruned += 1
 
     if dry_run:
-        print(f"\n  ℹ️  Dry-run: {report.nodes_merged} duplicates found, "
+        print(f"\n  [DRY-RUN] {report.nodes_merged} duplicates found, "
               f"{report.nodes_deleted} would be deleted.")
         print(f"     Call run_consolidation(db, dry_run=False) to execute.\n")
 

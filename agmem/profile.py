@@ -177,7 +177,7 @@ def generate_profile(
 
     sections: List[str] = []
     current_len = 0
-    header = "## 👤 User Profile\n\n"
+    header = "## User Profile\n\n"
 
     # Preferences first (highest value).
     pref_text = _format_preferences(groups.get("preference", []))
